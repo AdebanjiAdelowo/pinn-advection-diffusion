@@ -26,9 +26,19 @@ where $r = u_t + c\,u_x - \nu\,u_{xx}$ is computed by automatic differentiation 
 
 ## Results
 
-Relative $L^2$ error over the full space-time domain: **~5 × 10⁻³**
+Relative $L^2$ error over the full space-time domain: **~5 × 10⁻³** (independently reproduced via a
+full from-scratch 15,000-epoch retrain: $5.140\times10^{-3}$, 2m26s wall-clock on CPU).
 
 ![PINN result](pinn_result.png)
+
+## Limitations
+
+The periodic boundary condition above enforces function-value periodicity, $u_\theta(0,t) = u_\theta(1,t)$,
+but not derivative periodicity, $u_{\theta,x}(0,t) = u_{\theta,x}(1,t)$. For this smooth, low-frequency
+problem this is empirically inconsequential (the reported error already matches the exact solution to
+$\sim5\times10^{-3}$), but it is not the most complete periodic-BC formulation in the PINN literature;
+enforcing derivative periodicity as an additional loss term would be a natural refinement for problems
+with sharper solution features.
 
 ## Usage
 
