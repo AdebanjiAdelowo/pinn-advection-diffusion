@@ -3,13 +3,19 @@ Physics-Informed Neural Network for the 1D Advection-Diffusion Equation
 
 PDE:   u_t + c u_x = nu u_xx,   x in [0, 1],  t in [0, T]
 IC:    u(x, 0) = sin(2 pi x)
-BC:    periodic  (u(0, t) = u(1, t))
+BC:    periodic  (u(0, t) = u(1, t)  and  u_x(0, t) = u_x(1, t))
 Exact: u(x, t) = exp(-nu (2 pi)^2 t) sin(2 pi (x - c t))
 
 The PDE residual, initial condition, and boundary condition are embedded
 directly into the training loss, so the neural network is constrained to
 satisfy the physics throughout the domain.
+
+The PDE is second order in x, so a well-posed periodic problem needs both
+value and derivative periodicity. `derivative_bc=False` in `train` reproduces
+the original value-only formulation (kept for the controlled comparison).
 """
+
+import argparse
 
 import torch
 import torch.nn as nn
@@ -64,13 +70,50 @@ def pde_residual(model: PINN, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Periodic boundary condition
+# ---------------------------------------------------------------------------
+
+def periodic_bc_losses(model: nn.Module, t: torch.Tensor, derivative: bool = True):
+    """Periodic-BC loss terms between x = 0 and x = 1 at the times `t`.
+
+    Returns (loss_u, loss_ux). loss_u is the mean squared mismatch of
+    u(0,t) - u(1,t). loss_ux is the mean squared mismatch of u_x(0,t) - u_x(1,t)
+    (u_x by automatic differentiation), or None when `derivative` is False.
+    """
+    x0 = torch.zeros_like(t)
+    x1 = torch.ones_like(t)
+    if derivative:
+        x0.requires_grad_(True)
+        x1.requires_grad_(True)
+    u0, u1 = model(x0, t), model(x1, t)
+    loss_u = torch.mean((u0 - u1) ** 2)
+    if not derivative:
+        return loss_u, None
+    ux0 = torch.autograd.grad(u0.sum(), x0, create_graph=True)[0]
+    ux1 = torch.autograd.grad(u1.sum(), x1, create_graph=True)[0]
+    return loss_u, torch.mean((ux0 - ux1) ** 2)
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
-def train(n_epochs: int = 15000, lr: float = 1e-3) -> PINN:
+def train(n_epochs: int = 15000, lr: float = 1e-3, derivative_bc: bool = True,
+          seed: int | None = None, verbose: bool = True, return_history: bool = False):
+    """Train the PINN. `derivative_bc=False` is the original value-only periodic BC.
+
+    `seed` re-seeds torch/numpy before the network is built (the module-level
+    seed of 42 is used when None). With `return_history=True` returns
+    (model, history), history being the component losses of the current batch
+    every 500 epochs and at the last epoch.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
     model = PINN(width=64, depth=4)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.5)
+    history = []
 
     for epoch in range(n_epochs):
         optimizer.zero_grad()
@@ -80,11 +123,10 @@ def train(n_epochs: int = 15000, lr: float = 1e-3) -> PINN:
         t_ic = torch.zeros(200, 1)
         loss_ic = torch.mean((model(x_ic, t_ic) - u_exact(x_ic, t_ic)) ** 2)
 
-        # --- periodic boundary condition: u(0,t) = u(1,t) ---
-        t_bc  = torch.rand(100, 1) * T
-        x_bc0 = torch.zeros(100, 1)
-        x_bc1 = torch.ones(100, 1)
-        loss_bc = torch.mean((model(x_bc0, t_bc) - model(x_bc1, t_bc)) ** 2)
+        # --- periodic boundary condition: u(0,t) = u(1,t), u_x(0,t) = u_x(1,t) ---
+        t_bc = torch.rand(100, 1) * T
+        loss_bc_u, loss_bc_ux = periodic_bc_losses(model, t_bc, derivative_bc)
+        loss_bc = loss_bc_u if loss_bc_ux is None else loss_bc_u + loss_bc_ux
 
         # --- PDE collocation points ---
         x_pde = torch.rand(2000, 1).requires_grad_(True)
@@ -97,14 +139,20 @@ def train(n_epochs: int = 15000, lr: float = 1e-3) -> PINN:
         optimizer.step()
         scheduler.step()
 
-        if epoch % 1000 == 0:
+        if epoch % 500 == 0 or epoch == n_epochs - 1:
+            history.append(dict(
+                epoch=epoch, loss=loss.item(), pde=loss_pde.item(), ic=loss_ic.item(),
+                bc_u=loss_bc_u.item(),
+                bc_ux=None if loss_bc_ux is None else loss_bc_ux.item()))
+
+        if verbose and epoch % 1000 == 0:
             with torch.no_grad():
                 x_t = torch.linspace(0, 1, 200).unsqueeze(1)
                 t_t = torch.full((200, 1), T)
                 l2 = torch.mean((model(x_t, t_t) - u_exact(x_t, t_t)) ** 2).sqrt()
             print(f"epoch {epoch:5d}  loss={loss.item():.3e}  L2_err(t=T)={l2.item():.3e}")
 
-    return model
+    return (model, history) if return_history else model
 
 
 # ---------------------------------------------------------------------------
@@ -156,5 +204,12 @@ def plot(model: PINN, filename: str = "pinn_result.png") -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    model = train()
-    plot(model)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument("--bc", choices=["value", "value+derivative"], default="value+derivative",
+                        help="periodic BC: value only (original) or value + derivative (default)")
+    parser.add_argument("--out", default=None, help="output figure (default depends on --bc)")
+    args = parser.parse_args()
+    derivative_bc = args.bc == "value+derivative"
+    out = args.out or ("pinn_result_value_derivative.png" if derivative_bc else "pinn_result.png")
+    model = train(derivative_bc=derivative_bc)
+    plot(model, out)
