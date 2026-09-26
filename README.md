@@ -31,6 +31,33 @@ The first version of this repository used A. B adds the derivative term and chan
 
 B is the default because it states the intended periodic second-order spatial problem correctly, not because it is more accurate (see the results below). A remains available for reproducing the historical experiment.
 
+One training iteration of `train` in `pinn.py`. All points are resampled uniformly at every
+iteration; the dashed term is the only difference between A and B:
+
+```mermaid
+flowchart LR
+    subgraph PTS["Points resampled each iteration"]
+        R["2000 collocation (x, t)"]
+        I["200 initial points (x, 0)"]
+        B["100 boundary times t"]
+    end
+    NET["u_θ(x, t)<br/>MLP 2 → 4 × 64 tanh → 1"]
+    R --> NET
+    I --> NET
+    B --> NET
+    NET --> AD["autograd<br/>u_t, u_x, u_xx"]
+    AD --> LR["PDE loss<br/>mean (u_t + c u_x − ν u_xx)²"]
+    NET --> LI["IC loss<br/>mean (u_θ(x, 0) − sin 2πx)²"]
+    NET --> LBU["BC value loss<br/>mean (u_θ(0, t) − u_θ(1, t))²"]
+    AD -.B only.-> LBX["BC derivative loss<br/>mean (u_x(0, t) − u_x(1, t))²"]
+    LR --> SUM["total loss, unit weights"]
+    LI --> SUM
+    LBU --> SUM
+    LBX -.-> SUM
+    SUM --> OPT["Adam, lr 10⁻³<br/>halved every 5000 iterations"]
+    OPT -->|update θ| NET
+```
+
 ## Architecture
 
 - Fully connected network: input $(x,t)$ → 4 hidden layers (width 64, tanh) → scalar $u$
